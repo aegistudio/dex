@@ -1,0 +1,20 @@
+\documentclass[{{.FontSize}}pt,preview]{standalone}
+%% keep the same style for the rendered text as latex
+\usepackage[utf8x]{inputenc}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{amstext}
+\usepackage{newtxtext}
+\usepackage[libertine]{newtxmath}
+%% begin tikz premables and contents
+\usepackage{tikz}
+{{attrfmt "packages" "\\usepackage{%s}"}}
+{{attrfmt "tikzlibraries" "\\usetikzlibrary{%s}"}}
+\begin{document}
+\begin{preview}
+\begin{tikzpicture}{{attrfmt "tikzstyle" "[%s]"}}
+{{.Code}}
+\end{tikzpicture}
+\end{preview}
+\end{document}

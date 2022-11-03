@@ -1,0 +1,14 @@
+\documentclass[{{.FontSize}}pt,preview]{standalone}
+\usepackage[utf8x]{inputenc}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{amstext}
+\usepackage{newtxtext}
+\usepackage[libertine]{newtxmath}
+{{attrfmt "packages" "\\usepackage{%s}"}}
+\begin{document}
+\begin{preview}
+{{.Code}}
+\end{preview}
+\end{document}

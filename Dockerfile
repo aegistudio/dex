@@ -11,12 +11,6 @@ RUN cd /build && \
 # Release the DeX container with TeXLive and TiKZ depenencies.
 FROM debian:bullseye-slim as runner
 
-RUN mkdir -p /app
-
-COPY ./preset/ /app
-
-COPY --from=builder /build/dex /app/dex
-
 RUN apt update -y && \
     apt install --no-install-recommends -y dvisvgm pdf2svg scour texlive-latex-base texlive-latex-extra texlive-pictures xz-utils curl ca-certificates && \
     apt autoremove -y && \
@@ -28,5 +22,11 @@ RUN tlmgr init-usertree && \
     tlmgr option docfiles 0 && \
     tlmgr install stix2-type1 filemod ucs currfile varwidth adjustbox standalone newtx kastrup && \
     updmap-sys
+
+RUN mkdir -p /app
+
+COPY ./preset/ /app
+
+COPY --from=builder /build/dex /app/dex
 
 ENTRYPOINT ["/app/dex"]

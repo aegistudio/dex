@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io/fs"
 	"io/ioutil"
 	"net/http"
@@ -157,7 +158,7 @@ func transformNode(
 	}
 
 	// Perform transformation into the SVG document.
-	svg, err := tex2svg.Generate(
+	generated, err := tex2svg.Generate(
 		ctx, n.Data, b.String(),
 		tex2svg.WithOptions(options...),
 		tex2svg.WithAttributes(attrs),
@@ -175,6 +176,17 @@ func transformNode(
 	}
 	falling["class"] = newClass
 
+	// XXX: modify the style of generated result by adding
+	// a line of vertical alignment to them.
+	if generated.Baseline != 0 {
+		newStyle := fmt.Sprintf(
+			"vertical-align:%.6fem", -generated.Baseline)
+		if style, ok := falling["style"]; ok {
+			newStyle = style + ";" + newStyle
+		}
+		falling["style"] = newStyle
+	}
+
 	// Collect the result and construct the result node.
 	result := &html.Node{
 		Type:     html.ElementNode,
@@ -184,7 +196,7 @@ func transformNode(
 	result.Attr = append(result.Attr, html.Attribute{
 		Key: "src",
 		Val: "data:image/svg+xml;base64," +
-			base64.StdEncoding.EncodeToString(svg),
+			base64.StdEncoding.EncodeToString(generated.Data),
 	})
 	for key, val := range falling {
 		result.Attr = append(result.Attr, html.Attribute{

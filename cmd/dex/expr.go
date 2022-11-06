@@ -48,14 +48,15 @@ var cmdExpr = &cobra.Command{
 		}
 
 		// Generate SVG image for the input.
-		svg, err := tex2svg.Generate(ctx, exprType, content,
+		result, err := tex2svg.Generate(ctx, exprType, content,
 			tex2svg.WithOptions(options...),
 			tex2svg.WithAttributes(attrs))
 		if err != nil {
 			return err
 		}
+		// TODO: print out other metrics in tex2svg.Result.
 		println("data:image/svg+xml;base64," +
-			base64.StdEncoding.EncodeToString(svg))
+			base64.StdEncoding.EncodeToString(result.Data))
 		return nil
 	})).RunE,
 }

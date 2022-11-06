@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"text/template"
 
 	"github.com/pkg/errors"
@@ -37,6 +38,9 @@ type option struct {
 // regexpLastError for matching the error pattern found
 // in the latex execution log.
 var regexpLatexError = regexp.MustCompilePOSIX("^! (.*)$")
+
+// regexpDvisvgmDepth for matching depth information.
+var regexpDvisvgmDepth = regexp.MustCompile("\\bdepth=([0-9.e-]+)pt")
 
 // Option passed for controlling the SVG generation.
 type Option func(*option)
@@ -156,10 +160,16 @@ func WithOptions(opts ...Option) Option {
 	}
 }
 
+// Result is the result of tex2svg generation.
+type Result struct {
+	Data     []byte
+	Baseline float64
+}
+
 // Generate SVG using the provided LaTeX data.
 func Generate(
 	ctx context.Context, typ, code string, opts ...Option,
-) ([]byte, error) {
+) (*Result, error) {
 	var option option
 	option.fontSize = 12
 	option.precision = 4
@@ -260,13 +270,22 @@ func Generate(
 		"--no-fonts", "--exact-bbox", "code.dvi")
 	dvisvgmCmd.Dir = workDir
 	option.logger.Infof("command %q execute", dvisvgmCmd)
-	if output, err := dvisvgmCmd.CombinedOutput(); err != nil {
-		if len(output) > 0 {
+	dvisvgmOutput, err := dvisvgmCmd.CombinedOutput()
+	if err != nil {
+		if len(dvisvgmOutput) > 0 {
 			option.logger.Errorf("command %q error: %s",
-				dvisvgmCmd, string(output))
+				dvisvgmCmd, string(dvisvgmOutput))
 		}
 		return nil, errors.Wrap(err, "exec dvisvgm")
 	}
+
+	// Extract baseline information from the output.
+	var depth float64
+	depthMatch := regexpDvisvgmDepth.FindSubmatch(dvisvgmOutput)
+	if len(depthMatch) >= 2 {
+		depth, _ = strconv.ParseFloat(string(depthMatch[1]), 64)
+	}
+	baseline := 1.00375 * depth / float64(option.fontSize)
 
 	// Execute the scour optimize command.
 	scourExePath, err := exec.LookPath("scour")
@@ -295,5 +314,8 @@ func Generate(
 	if err != nil {
 		return nil, errors.Wrap(err, "read SVG file")
 	}
-	return svg, nil
+	return &Result{
+		Data:     svg,
+		Baseline: baseline,
+	}, nil
 }

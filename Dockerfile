@@ -20,7 +20,7 @@ RUN apt update -y && \
 RUN tlmgr init-usertree && \
     tlmgr option repository https://ftp.math.utah.edu/pub/tex/historic/systems/texlive/2020/tlnet-final/ && \
     tlmgr option docfiles 0 && \
-    tlmgr install stix2-type1 filemod ucs currfile varwidth adjustbox standalone newtx kastrup && \
+    tlmgr install stix2-type1 filemod ucs currfile varwidth adjustbox standalone newtx kastrup collection-fontsrecommended && \
     updmap-sys
 
 RUN mkdir -p /app

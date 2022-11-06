@@ -134,11 +134,16 @@ func replaceDollarExpr(node *html.Node, set map[string]struct{}) {
 func transformNode(
 	ctx context.Context, n *html.Node, options []tex2svg.Option,
 ) (*html.Node, error) {
-	// Extract the content for conversion. The nodes under
-	// it will be either copied or rendered.
+	// Extract the content for conversion.
 	var b bytes.Buffer
 	for m := n.FirstChild; m != nil; m = m.NextSibling {
-		if err := html.Render(&b, m); err != nil {
+		// XXX: containing nodes other than text node is illformed
+		// and we will just concatenate all text nodes.
+		if m.Type != html.TextNode {
+			return nil, errors.Errorf(
+				"unexpected non-text node under %q", n.Data)
+		}
+		if _, err := b.WriteString(m.Data); err != nil {
 			return nil, err
 		}
 	}

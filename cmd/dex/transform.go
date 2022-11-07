@@ -17,6 +17,7 @@ import (
 	"github.com/aegistudio/shaft"
 	"github.com/aegistudio/shaft/serpent"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
@@ -212,56 +213,68 @@ func transformNode(
 	return result, nil
 }
 
-// transformDOM attempts to scan and transform the HTML body.
+// transformNodeTask is the task to transform a node into its
+// svg rendered counterpart.
 //
-// The node must be from the body and only those in set will be
-// scanned and dispatched for transformation.
+// The job completion is done by closing the done channel which
+// is initialized by its caller.
+type transformNodeTask struct {
+	n, svgNode *html.Node
+	err        error
+	doneCh     chan struct{}
+}
+
+// runNodeWorkerThread executes the thread that consumes nodes
+// transform the nodes with their error returned.
+func runNodeWorkerThread(
+	ctx context.Context, taskCh <-chan *transformNodeTask,
+	options []tex2svg.Option,
+) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case task := <-taskCh:
+			task.svgNode, task.err = transformNode(ctx, task.n, options)
+			close(task.doneCh)
+		}
+	}
+}
+
+// extractDOM attempts to extract pending tasks inside HTML.
+//
+// The extracted nodes have their sibling and parenting
+// information, so we can manipulate them even without knowing
+// their position in DOM.
 //
 // The currently scanned node is asserted not to be inside the
 // transform set. We usually start from the "<body>" node.
-func transformDOM(
-	ctx context.Context, node *html.Node, haltOnError bool,
-	set map[string]struct{}, options []tex2svg.Option,
-) error {
+func extractDOM(node *html.Node, set map[string]struct{}) []*html.Node {
 	if node.Type != html.ElementNode {
 		return nil
 	}
 	if node.FirstChild == nil {
 		return nil
 	}
-	n := node.FirstChild
-	for n != nil {
-		next := n.NextSibling
-		if err := func() error {
-			if n.Type != html.ElementNode {
-				return nil
-			}
-			if _, ok := set[n.Data]; !ok {
-				return transformDOM(ctx, n, haltOnError, set, options)
-			}
-			svgNode, err := transformNode(ctx, n, options)
-			if err != nil {
-				if !haltOnError {
-					err = nil
-				}
-				return err
-			}
-			node.InsertBefore(svgNode, n)
-			node.RemoveChild(n)
-			return nil
-		}(); err != nil {
-			return err
+	var nodes []*html.Node
+	for n := node.FirstChild; n != nil; n = n.NextSibling {
+		if n.Type != html.ElementNode {
+			continue
 		}
-		n = next
+		if _, ok := set[n.Data]; ok {
+			nodes = append(nodes, n)
+		} else {
+			nodes = append(nodes, extractDOM(n, set)...)
+		}
 	}
-	return nil
+	return nodes
 }
 
 // transformHTMLFile performs the transformation of an HTML file.
 func transformHTMLFile(
 	ctx context.Context, src, dst string,
 	scanSet, transformSet map[string]struct{},
-	haltOnError bool, options []tex2svg.Option,
+	haltOnError bool, taskCh chan<- *transformNodeTask,
 ) error {
 	// Attempt to read and parse the HTML first.
 	data, err := ioutil.ReadFile(src)
@@ -302,9 +315,36 @@ func transformHTMLFile(
 	replaceDollarExpr(bodyNode, scanSet)
 
 	// Perform recursive replacement of transform nodes.
-	if err := transformDOM(
-		ctx, bodyNode, haltOnError, transformSet, options); err != nil {
-		return errors.Wrapf(err, "transform file %q", src)
+	nodes := extractDOM(bodyNode, transformSet)
+	var tasks []*transformNodeTask
+	for _, n := range nodes {
+		task := &transformNodeTask{
+			n:      n,
+			doneCh: make(chan struct{}),
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case taskCh <- task:
+		}
+		tasks = append(tasks, task)
+	}
+	for _, task := range tasks {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-task.doneCh:
+			if task.err != nil {
+				if haltOnError {
+					return errors.Wrapf(
+						task.err, "transform file %q", src)
+				}
+			} else {
+				parent := task.n.Parent
+				parent.InsertBefore(task.svgNode, task.n)
+				parent.RemoveChild(task.n)
+			}
+		}
 	}
 
 	// Render the translated DOM and write to the file.
@@ -405,11 +445,11 @@ func runDispatchThread(
 	})
 }
 
-// runWorkerThread consumes the task channel and work.
-func runWorkerThread(
+// runHTMLWorkerThread consumes the task channel and work.
+func runHTMLWorkerThread(
 	ctx context.Context, taskCh <-chan transformTask,
 	scanSet, transformSet map[string]struct{},
-	haltOnError bool, options []tex2svg.Option,
+	haltOnError bool, nodeCh chan<- *transformNodeTask,
 ) error {
 	for {
 		var task transformTask
@@ -423,7 +463,7 @@ func runWorkerThread(
 			}
 			if err := transformHTMLFile(
 				ctx, task.src, task.dst,
-				scanSet, transformSet, haltOnError, options); err != nil {
+				scanSet, transformSet, haltOnError, nodeCh); err != nil {
 				return err
 			}
 		}
@@ -450,8 +490,8 @@ var cmdTransform = &cobra.Command{
 	Short: "scan HTML documents and perform transmation",
 	RunE: serpent.Executor(shaft.Invoke(func(
 		commandCtx serpent.CommandContext, args serpent.CommandArgs,
-		options []tex2svg.Option,
-	) error {
+		options []tex2svg.Option, log *logrus.Logger,
+	) (rerr error) {
 		// Evaluate actual path for dispatching tasks.
 		inputDir := transformInputDir
 		if inputDir == "" {
@@ -490,8 +530,37 @@ var cmdTransform = &cobra.Command{
 			transformSet[v] = struct{}{}
 		}
 
-		// Create the error group for starting tasks.
-		group, ctx := errgroup.WithContext(commandCtx)
+		// Evaluates the number of threads to start.
+		jobs := transformJobs
+		if jobs == 0 {
+			jobs = runtime.GOMAXPROCS(0)
+		}
+		if jobs == 0 {
+			jobs = 1
+		}
+		log.Infof("dispatching %d tasks", jobs)
+
+		// Create the node group, which is an ambient group but
+		// will wait for the tasks to complete.
+		rootCtx, rootCancel := context.WithCancel(commandCtx)
+		daemonGroup, daemonCtx := errgroup.WithContext(rootCtx)
+		defer func() {
+			if err := daemonGroup.Wait(); err != nil && rerr == nil {
+				rerr = err
+			}
+		}()
+		defer rootCancel()
+
+		// Create the node worker daemon threads.
+		nodeCh := make(chan *transformNodeTask)
+		for i := 0; i < jobs; i++ {
+			daemonGroup.Go(func() error {
+				return runNodeWorkerThread(daemonCtx, nodeCh, options)
+			})
+		}
+
+		// Create the error group for foreground tasks.
+		group, ctx := errgroup.WithContext(daemonCtx)
 
 		// Create the dispatcher thread and dispatcher channel.
 		taskCh := make(chan transformTask)
@@ -501,18 +570,11 @@ var cmdTransform = &cobra.Command{
 		})
 
 		// Start worker threads for performing transformation.
-		jobs := transformJobs
-		if jobs == 0 {
-			jobs = runtime.GOMAXPROCS(0)
-		}
-		if jobs == 0 {
-			jobs = 1
-		}
 		for i := 0; i < jobs; i++ {
 			group.Go(func() error {
-				return runWorkerThread(
+				return runHTMLWorkerThread(
 					ctx, taskCh, scanSet, transformSet,
-					transformHaltOnError, options)
+					transformHaltOnError, nodeCh)
 			})
 		}
 

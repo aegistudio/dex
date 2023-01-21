@@ -12,10 +12,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/aegistudio/shaft"
 	"github.com/aegistudio/shaft/serpent"
+	"github.com/hashicorp/golang-lru"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -131,9 +133,14 @@ func replaceDollarExpr(node *html.Node, set map[string]struct{}) {
 	}
 }
 
+type transformCacheKey struct {
+	template, content, attrPairs string
+}
+
 // transformNode transforms a single matched node.
 func transformNode(
-	ctx context.Context, n *html.Node, options []tex2svg.Option,
+	ctx context.Context, cache *lru.Cache,
+	n *html.Node, options []tex2svg.Option,
 ) (*html.Node, error) {
 	// Extract the content for conversion.
 	var b bytes.Buffer
@@ -154,18 +161,36 @@ func transformNode(
 	// to the transformer's attribtues.
 	falling := make(map[string]string)
 	attrs := make(map[string]string)
+	var attrKeys []string
 	for _, attr := range n.Attr {
 		switch attr.Key {
 		case "id", "class", "style", "alt":
 			falling[attr.Key] = attr.Val
 		default:
 			attrs[attr.Key] = attr.Val
+			attrKeys = append(attrKeys, attr.Key)
 		}
+	}
+
+	// Generate the cache key from given content.
+	var cacheKey transformCacheKey
+	cacheKey.template = n.Data
+	cacheKey.content = b.String()
+	sort.Strings(attrKeys)
+	for _, key := range attrKeys {
+		cacheKey.attrPairs = cacheKey.attrPairs + " " +
+			fmt.Sprintf("%s=%q", key, attrs[key])
+	}
+
+	// Attempt to fetch the key from the result list.
+	if value, ok := cache.Get(cacheKey); ok {
+		result := value.(html.Node)
+		return &result, nil
 	}
 
 	// Perform transformation into the SVG document.
 	generated, err := tex2svg.Generate(
-		ctx, n.Data, b.String(),
+		ctx, cacheKey.template, cacheKey.content,
 		tex2svg.WithOptions(options...),
 		tex2svg.WithAttributes(attrs),
 	)
@@ -194,7 +219,7 @@ func transformNode(
 	}
 
 	// Collect the result and construct the result node.
-	result := &html.Node{
+	result := html.Node{
 		Type:     html.ElementNode,
 		Data:     "img",
 		DataAtom: atom.Img,
@@ -210,7 +235,8 @@ func transformNode(
 			Val: val,
 		})
 	}
-	return result, nil
+	_ = cache.Add(cacheKey, result)
+	return &result, nil
 }
 
 // transformNodeTask is the task to transform a node into its
@@ -228,14 +254,15 @@ type transformNodeTask struct {
 // transform the nodes with their error returned.
 func runNodeWorkerThread(
 	ctx context.Context, taskCh <-chan *transformNodeTask,
-	options []tex2svg.Option,
+	options []tex2svg.Option, cache *lru.Cache,
 ) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case task := <-taskCh:
-			task.svgNode, task.err = transformNode(ctx, task.n, options)
+			task.svgNode, task.err = transformNode(
+				ctx, cache, task.n, options)
 			close(task.doneCh)
 		}
 	}
@@ -475,6 +502,7 @@ var (
 	transformJobs        int
 	transformInputDir    string
 	transformOutputDir   string
+	transformCacheSize   = 256
 
 	transformScanNode = []string{
 		"a", "b", "strong", "i", "p", "li",
@@ -553,9 +581,14 @@ var cmdTransform = &cobra.Command{
 
 		// Create the node worker daemon threads.
 		nodeCh := make(chan *transformNodeTask)
+		cache, err := lru.New(transformCacheSize)
+		if err != nil {
+			return errors.Wrap(err, "create cache")
+		}
 		for i := 0; i < jobs; i++ {
 			daemonGroup.Go(func() error {
-				return runNodeWorkerThread(daemonCtx, nodeCh, options)
+				return runNodeWorkerThread(
+					daemonCtx, nodeCh, options, cache)
 			})
 		}
 
@@ -602,5 +635,8 @@ func init() {
 	cmdTransform.PersistentFlags().StringSliceVarP(
 		&transformTransformNode, "transform", "t", transformTransformNode,
 		"tags to be transformed into rendered image")
+	cmdTransform.PersistentFlags().IntVar(
+		&transformCacheSize, "cache-size", transformCacheSize,
+		"size of the transform result cache")
 	rootCmd.AddCommand(cmdTransform)
 }

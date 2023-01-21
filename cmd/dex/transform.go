@@ -14,10 +14,10 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	textTemplate "text/template"
 
 	"github.com/aegistudio/shaft"
 	"github.com/aegistudio/shaft/serpent"
-	"github.com/hashicorp/golang-lru"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -25,6 +25,7 @@ import (
 	"golang.org/x/net/html/atom"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/aegistudio/dex/tex2cache"
 	"github.com/aegistudio/dex/tex2svg"
 )
 
@@ -133,26 +134,22 @@ func replaceDollarExpr(node *html.Node, set map[string]struct{}) {
 	}
 }
 
-type transformCacheKey struct {
-	template, content, attrPairs string
-}
-
 // transformNode transforms a single matched node.
 func transformNode(
-	ctx context.Context, cache *lru.Cache,
-	n *html.Node, options []tex2svg.Option,
-) (*html.Node, error) {
+	ctx context.Context, n *html.Node,
+	options []tex2svg.Option,
+) (*tex2svg.Result, map[string]string, error) {
 	// Extract the content for conversion.
 	var b bytes.Buffer
 	for m := n.FirstChild; m != nil; m = m.NextSibling {
 		// XXX: containing nodes other than text node is illformed
 		// and we will just concatenate all text nodes.
 		if m.Type != html.TextNode {
-			return nil, errors.Errorf(
+			return nil, nil, errors.Errorf(
 				"unexpected non-text node under %q", n.Data)
 		}
 		if _, err := b.WriteString(m.Data); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -161,111 +158,25 @@ func transformNode(
 	// to the transformer's attribtues.
 	falling := make(map[string]string)
 	attrs := make(map[string]string)
-	var attrKeys []string
 	for _, attr := range n.Attr {
 		switch attr.Key {
 		case "id", "class", "style", "alt":
 			falling[attr.Key] = attr.Val
 		default:
 			attrs[attr.Key] = attr.Val
-			attrKeys = append(attrKeys, attr.Key)
 		}
-	}
-
-	// Generate the cache key from given content.
-	var cacheKey transformCacheKey
-	cacheKey.template = n.Data
-	cacheKey.content = b.String()
-	sort.Strings(attrKeys)
-	for _, key := range attrKeys {
-		cacheKey.attrPairs = cacheKey.attrPairs + " " +
-			fmt.Sprintf("%s=%q", key, attrs[key])
-	}
-
-	// Attempt to fetch the key from the result list.
-	if value, ok := cache.Get(cacheKey); ok {
-		result := value.(html.Node)
-		return &result, nil
 	}
 
 	// Perform transformation into the SVG document.
 	generated, err := tex2svg.Generate(
-		ctx, cacheKey.template, cacheKey.content,
+		ctx, n.Data, b.String(),
 		tex2svg.WithOptions(options...),
 		tex2svg.WithAttributes(attrs),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	// XXX: modify the class of generated node to be
-	// related to our framework, so that its style could
-	// be tweaked conveniently.
-	newClass := "dex-" + n.Data
-	if class, ok := falling["class"]; ok {
-		newClass = class + " " + newClass
-	}
-	falling["class"] = newClass
-
-	// XXX: modify the style of generated result by adding
-	// a line of vertical alignment to them.
-	if generated.Baseline != 0 {
-		newStyle := fmt.Sprintf(
-			"vertical-align:%.6fem", -generated.Baseline)
-		if style, ok := falling["style"]; ok {
-			newStyle = style + ";" + newStyle
-		}
-		falling["style"] = newStyle
-	}
-
-	// Collect the result and construct the result node.
-	result := html.Node{
-		Type:     html.ElementNode,
-		Data:     "img",
-		DataAtom: atom.Img,
-	}
-	result.Attr = append(result.Attr, html.Attribute{
-		Key: "src",
-		Val: "data:image/svg+xml;base64," +
-			base64.StdEncoding.EncodeToString(generated.Data),
-	})
-	for key, val := range falling {
-		result.Attr = append(result.Attr, html.Attribute{
-			Key: key,
-			Val: val,
-		})
-	}
-	_ = cache.Add(cacheKey, result)
-	return &result, nil
-}
-
-// transformNodeTask is the task to transform a node into its
-// svg rendered counterpart.
-//
-// The job completion is done by closing the done channel which
-// is initialized by its caller.
-type transformNodeTask struct {
-	n, svgNode *html.Node
-	err        error
-	doneCh     chan struct{}
-}
-
-// runNodeWorkerThread executes the thread that consumes nodes
-// transform the nodes with their error returned.
-func runNodeWorkerThread(
-	ctx context.Context, taskCh <-chan *transformNodeTask,
-	options []tex2svg.Option, cache *lru.Cache,
-) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case task := <-taskCh:
-			task.svgNode, task.err = transformNode(
-				ctx, cache, task.n, options)
-			close(task.doneCh)
-		}
-	}
+	return generated, falling, nil
 }
 
 // extractDOM attempts to extract pending tasks inside HTML.
@@ -297,11 +208,27 @@ func extractDOM(node *html.Node, set map[string]struct{}) []*html.Node {
 	return nodes
 }
 
+// templateStyle is the template of a style item.
+var templateStyle = textTemplate.Must(textTemplate.New("").Parse(`
+.{{.Class}} {
+	content: url({{.Image}});
+	vertical-align: {{.VerticalAlign}};
+	display: inline-block; width: fit-content; height: fit-content;
+}
+`))
+
+// transformResultKey is the content key for identifying each
+// generated result and aggregate them.
+type transformResultKey struct {
+	content  string
+	baseline float64
+}
+
 // transformHTMLFile performs the transformation of an HTML file.
 func transformHTMLFile(
 	ctx context.Context, src, dst string,
 	scanSet, transformSet map[string]struct{},
-	haltOnError bool, taskCh chan<- *transformNodeTask,
+	haltOnError bool, options []tex2svg.Option,
 ) error {
 	// Attempt to read and parse the HTML first.
 	data, err := ioutil.ReadFile(src)
@@ -325,8 +252,16 @@ func transformHTMLFile(
 	if htmlNode == nil {
 		return nil
 	}
-
-	// Scan for body node and start transforming.
+	var headNode *html.Node
+	for n := htmlNode.FirstChild; n != nil; n = n.NextSibling {
+		if n.Type == html.ElementNode && n.DataAtom == atom.Head {
+			headNode = n
+			break
+		}
+	}
+	if headNode == nil {
+		return nil
+	}
 	var bodyNode *html.Node
 	for n := htmlNode.FirstChild; n != nil; n = n.NextSibling {
 		if n.Type == html.ElementNode && n.DataAtom == atom.Body {
@@ -341,37 +276,93 @@ func transformHTMLFile(
 	// Scan and replace the double dollar expression.
 	replaceDollarExpr(bodyNode, scanSet)
 
-	// Perform recursive replacement of transform nodes.
+	// Store the transformation result so that we can
+	// aggregate elements with identical image together.
 	nodes := extractDOM(bodyNode, transformSet)
-	var tasks []*transformNodeTask
+	results := make(map[transformResultKey]int)
+	lastIndex := 0
 	for _, n := range nodes {
-		task := &transformNodeTask{
-			n:      n,
-			doneCh: make(chan struct{}),
+		result, attrs, err := transformNode(ctx, n, options)
+		if err != nil {
+			if haltOnError {
+				return errors.Wrapf(
+					err, "transform file %q", src)
+			}
+			continue
 		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case taskCh <- task:
+		key := transformResultKey{
+			content: "data:image/svg+xml;base64," +
+				base64.StdEncoding.EncodeToString(result.Data),
+			baseline: result.Baseline,
 		}
-		tasks = append(tasks, task)
+		id, ok := results[key]
+		if !ok {
+			id = lastIndex
+			lastIndex++
+			results[key] = id
+		}
+
+		// Create a new class for the generated node.
+		newClass := fmt.Sprintf("dex-%x", id)
+		if class, ok := attrs["class"]; ok {
+			newClass = class + " " + newClass
+		}
+		attrs["class"] = newClass
+		var attrKeys []string
+		for attr := range attrs {
+			attrKeys = append(attrKeys, attr)
+		}
+		sort.Strings(attrKeys)
+		svgNode := &html.Node{
+			Type: html.ElementNode,
+			Data: "dex",
+		}
+		for _, attr := range attrKeys {
+			svgNode.Attr = append(svgNode.Attr, html.Attribute{
+				Key: attr,
+				Val: attrs[attr],
+			})
+		}
+		parent := n.Parent
+		parent.InsertBefore(svgNode, n)
+		parent.RemoveChild(n)
 	}
-	for _, task := range tasks {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-task.doneCh:
-			if task.err != nil {
-				if haltOnError {
-					return errors.Wrapf(
-						task.err, "transform file %q", src)
-				}
-			} else {
-				parent := task.n.Parent
-				parent.InsertBefore(task.svgNode, task.n)
-				parent.RemoveChild(task.n)
+
+	// Insert the style blocks after the HTML block.
+	if len(nodes) > 0 {
+		orderedResult := make([]transformResultKey, lastIndex)
+		for result, i := range results {
+			orderedResult[i] = result
+		}
+		var styleBuffer bytes.Buffer
+		for id, result := range orderedResult {
+			var data struct {
+				Class         string
+				Image         string
+				VerticalAlign string
+			}
+			data.Class = fmt.Sprintf("dex-%x", id)
+			data.Image = result.content
+			data.VerticalAlign = fmt.Sprintf("%.6fem", -result.baseline)
+			if err := templateStyle.Execute(
+				&styleBuffer, &data); err != nil {
+				return errors.Wrapf(err, "write style buffer %q", src)
 			}
 		}
+		styleNode := &html.Node{
+			Type:     html.ElementNode,
+			Data:     "style",
+			DataAtom: atom.Style,
+		}
+		styleNode.Attr = append(styleNode.Attr, html.Attribute{
+			Key: "type",
+			Val: "text/css",
+		})
+		styleNode.AppendChild(&html.Node{
+			Type: html.TextNode,
+			Data: styleBuffer.String(),
+		})
+		headNode.AppendChild(styleNode)
 	}
 
 	// Render the translated DOM and write to the file.
@@ -476,7 +467,7 @@ func runDispatchThread(
 func runHTMLWorkerThread(
 	ctx context.Context, taskCh <-chan transformTask,
 	scanSet, transformSet map[string]struct{},
-	haltOnError bool, nodeCh chan<- *transformNodeTask,
+	haltOnError bool, options []tex2svg.Option,
 ) error {
 	for {
 		var task transformTask
@@ -490,7 +481,7 @@ func runHTMLWorkerThread(
 			}
 			if err := transformHTMLFile(
 				ctx, task.src, task.dst,
-				scanSet, transformSet, haltOnError, nodeCh); err != nil {
+				scanSet, transformSet, haltOnError, options); err != nil {
 				return err
 			}
 		}
@@ -502,7 +493,6 @@ var (
 	transformJobs        int
 	transformInputDir    string
 	transformOutputDir   string
-	transformCacheSize   = 256
 
 	transformScanNode = []string{
 		"a", "b", "strong", "i", "p", "li",
@@ -511,6 +501,10 @@ var (
 	transformTransformNode = []string{
 		"latex", "latexblk", "latexdoc", "tikz",
 	}
+
+	transformCacheDir    = ".cache"
+	transformCacheOutput = ""
+	transformCacheSize   = 1024
 )
 
 var cmdTransform = &cobra.Command{
@@ -579,18 +573,19 @@ var cmdTransform = &cobra.Command{
 		}()
 		defer rootCancel()
 
-		// Create the node worker daemon threads.
-		nodeCh := make(chan *transformNodeTask)
-		cache, err := lru.New(transformCacheSize)
+		// Create the persistent cache and add it to option.
+		cacheOutputDir := transformCacheDir
+		if transformCacheOutput != "" {
+			cacheOutputDir = transformCacheOutput
+		}
+		cache, err := tex2cache.New(
+			daemonCtx, daemonGroup,
+			transformCacheDir, cacheOutputDir,
+			transformCacheSize)
 		if err != nil {
-			return errors.Wrap(err, "create cache")
+			return err
 		}
-		for i := 0; i < jobs; i++ {
-			daemonGroup.Go(func() error {
-				return runNodeWorkerThread(
-					daemonCtx, nodeCh, options, cache)
-			})
-		}
+		options = append(options, tex2svg.WithCache(cache))
 
 		// Create the error group for foreground tasks.
 		group, ctx := errgroup.WithContext(daemonCtx)
@@ -607,7 +602,7 @@ var cmdTransform = &cobra.Command{
 			group.Go(func() error {
 				return runHTMLWorkerThread(
 					ctx, taskCh, scanSet, transformSet,
-					transformHaltOnError, nodeCh)
+					transformHaltOnError, options)
 			})
 		}
 
@@ -635,8 +630,14 @@ func init() {
 	cmdTransform.PersistentFlags().StringSliceVarP(
 		&transformTransformNode, "transform", "t", transformTransformNode,
 		"tags to be transformed into rendered image")
+	cmdTransform.PersistentFlags().StringVar(
+		&transformCacheDir, "cache-dir", transformCacheDir,
+		"directory to read and write the cache")
+	cmdTransform.PersistentFlags().StringVar(
+		&transformCacheDir, "cache-output", transformCacheDir,
+		"directory to alternative output of the cache")
 	cmdTransform.PersistentFlags().IntVar(
 		&transformCacheSize, "cache-size", transformCacheSize,
-		"size of the transform result cache")
+		"size of the cache to store in memory item")
 	rootCmd.AddCommand(cmdTransform)
 }

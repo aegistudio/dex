@@ -1,0 +1,34 @@
+// protoc --go_out=. ./tex2svg/proto/tex2svg.proto
+syntax = "proto3";
+
+package proto;
+
+// Key is the encoded content of key for looking up.
+message Key {
+	// Version is the content version which could be
+	// encoded in the protobuf.
+	//
+	// Currently the worst result is to regenerate all
+	// the content from scratch, which is acceptible.
+	uint64 version = 1;
+
+	// Tex is the content of generated TeX payload.
+	bytes tex = 2;
+
+	// Precision is the precision value sent to the
+	// scour SVG optimizer.
+	int64 precision = 3;
+
+	// ControlPrecision is the control precision
+	// value sent to the scour SVG optimizer.
+	int64 controlPrecision = 4;
+}
+
+// Value is the encoded content of generated result.
+message Value {
+	// Data is the generated SVG data.
+	bytes data = 1;
+
+	// Baseline is the baseline value stored.
+	double baseline = 2;
+}

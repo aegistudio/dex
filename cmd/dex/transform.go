@@ -634,7 +634,7 @@ func init() {
 		&transformCacheDir, "cache-dir", transformCacheDir,
 		"directory to read and write the cache")
 	cmdTransform.PersistentFlags().StringVar(
-		&transformCacheDir, "cache-output", transformCacheDir,
+		&transformCacheOutput, "cache-output", transformCacheOutput,
 		"directory to alternative output of the cache")
 	cmdTransform.PersistentFlags().IntVar(
 		&transformCacheSize, "cache-size", transformCacheSize,

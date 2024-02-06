@@ -495,7 +495,7 @@ var (
 	transformOutputDir   string
 
 	transformScanNode = []string{
-		"a", "b", "strong", "i", "p", "li",
+		"a", "b", "div", "strong", "i", "p", "li",
 		"h1", "h2", "h3", "h4", "h5",
 	}
 	transformTransformNode = []string{
